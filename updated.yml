@@ -1,0 +1,135 @@
+name: Deploy to EC2
+on:
+  push
+env:
+  TARGET_ENV: ${{ github.ref == 'refs/heads/prod' && 'prod' || 'uat' }}
+  API_URL: ${{ github.ref == 'refs/heads/prod' && 'https://iii.com.sg/api' || 'https://uatb2c.iii.com.sg/api' }}
+  API_VERSION: '/v1'
+  AWS_REGION: ap-southeast-1
+  AWS_DEPLOY_ROLE: ${{ github.ref == 'refs/heads/prod' && 'arn:aws:iam::428749252569:role/iii_github_cicd_prod' || 'arn:aws:iam::428749252569:role/iii_github_cicd_uat' }}
+  S3_BUCKET: ${{ github.ref == 'refs/heads/prod' && 'iii-common-prod' || 'iii-common-uat' }}
+  PRODUCT_NAME: 'personal-accident'
+  S3_FOLDER_KEY: 'personal-accident-insurance'
+
+jobs:
+  build:
+    if: |
+      github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Debug Environment Variables
+        run: |
+          echo "TARGET_ENV=${{ env.TARGET_ENV }}"
+          echo "API_URL=${{ env.API_URL }}"
+          echo "AWS_REGION=${{ env.AWS_REGION }}"
+          echo "S3_BUCKET=${{ env.S3_BUCKET }}"
+          echo "PRODUCT_NAME=${{ env.PRODUCT_NAME }}"
+          echo "S3_FOLDER_KEY=${{ env.S3_FOLDER_KEY }}"
+      
+      - name: Checkout code
+        uses: actions/checkout@v2
+      
+      - name: Create .env file
+        run: |
+          echo "NEXT_PUBLIC_GATEWAY_API_URL=${{ env.API_URL }}" > .env
+          echo "NEXT_PUBLIC_API_VERSION=${{ env.API_VERSION }}" >> .env
+          echo "NEXT_PUBLIC_GITHUB_BUILD_SHA_ID=${{ github.sha }}" >> .env
+          cp appspec-${{env.TARGET_ENV}}.yml appspec.yml
+          rm appspec-*.yml
+          cat .env
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install awscli -y
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Send build artifacts to S3
+        id: package
+        run: |
+          zip -r deploy.zip .
+          aws s3 cp deploy.zip "s3://${{ env.S3_BUCKET }}/builds/${{ env.S3_FOLDER_KEY }}/deploy-${{ github.sha }}.zip"
+          aws s3 ls "s3://${{ env.S3_BUCKET }}/builds/${{ env.S3_FOLDER_KEY }}/deploy-${{ github.sha }}.zip"
+
+  deploy:
+    needs: build
+    if: |
+      github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Debug Environment Variables
+        run: |
+          echo "TARGET_ENV=${{ env.TARGET_ENV }}"
+          echo "AWS_REGION=${{ env.AWS_REGION }}"
+          echo "S3_BUCKET=${{ env.S3_BUCKET }}"
+          echo "PRODUCT_NAME=${{ env.PRODUCT_NAME }}"
+          echo "S3_FOLDER_KEY=${{ env.S3_FOLDER_KEY }}"
+      
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install awscli -y
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy to EC2 via CodeDeploy and S3 artifacts
+        id: deploy
+        run: |
+          aws deploy create-deployment \
+            --application-name "${{ env.PRODUCT_NAME }}-insurance-app-${{env.TARGET_ENV}}" \
+            --deployment-group-name "${{ env.PRODUCT_NAME }}-insurance-${{env.TARGET_ENV}}" \
+            --deployment-config-name "CodeDeployDefault.OneAtATime" \
+            --s3-location "bucket=${{ env.S3_BUCKET }},key=builds/${{ env.S3_FOLDER_KEY }}/deploy-${{ github.sha }}.zip,bundleType=zip" \
+            --region "${{ env.AWS_REGION }}" \
+            --debug
+      
+      - name: Wait for deployment to complete
+        id: wait_deployment
+        run: |
+          deployment_id=$(aws deploy list-deployments \
+            --application-name "${{ env.PRODUCT_NAME }}-insurance-app-${{env.TARGET_ENV}}" \
+            --deployment-group-name "${{ env.PRODUCT_NAME }}-insurance-${{env.TARGET_ENV}}" \
+            --query 'deployments[0]' --output text --region "${{ env.AWS_REGION }}")
+
+          echo "Retrieved deployment ID: $deployment_id"
+          if [[ -z "$deployment_id" || "$deployment_id" == "None" ]]; then
+            echo "Error: No deployment ID found."
+            exit 1
+          fi
+
+          while true; do
+            STATUS=$(aws deploy get-deployment --deployment-id $deployment_id --query "deploymentInfo.status" --output text)
+            echo "Current status: $STATUS"
+
+            if [[ "$STATUS" == "Succeeded" ]]; then
+              echo "Deployment Succeeded!"
+              exit 0
+            elif [[ "$STATUS" == "Failed" || "$STATUS" == "Stopped" ]]; then
+              ERROR_MESSAGE=$(aws deploy get-deployment --deployment-id $deployment_id --query "deploymentInfo.errorInformation" --output json)
+              echo "Deployment Failed! Error details: $ERROR_MESSAGE"
+              exit 1
+            fi
+
+            echo "Waiting for deployment to complete..."
+            sleep 20
+          done
