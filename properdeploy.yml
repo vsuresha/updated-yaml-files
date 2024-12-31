@@ -1,0 +1,194 @@
+name: Deploy to EC2
+on:
+  push
+env:
+  TARGET_ENV:  ${{ github.ref == 'refs/heads/prod' && 'prod' || 'uat' }}
+  API_URL: ${{ github.ref == 'refs/heads/prod' && 'https://vmoscar4c2.execute-api.ap-southeast-1.amazonaws.com' || 'https://uatb2c.iii.com.sg/api' }}
+  API_VERSION: ${{ github.ref == 'refs/heads/prod' && '/v1' || '/v1' }}
+  AWS_REGION: ap-southeast-1
+  AWS_DEPLOY_ROLE: ${{ github.ref == 'refs/heads/prod' && 'arn:aws:iam::428749252569:role/iii_github_cicd_prod' || 'arn:aws:iam::428749252569:role/iii_github_cicd_uat' }}
+  S3_BUCKET: ${{ github.ref == 'refs/heads/prod' && 'iii-common-prod' || 'iii-common-uat' }}
+  SIRA_URL: ${{ github.ref == 'refs/heads/prod' && 'https://cssp-resources.integrate.cx/sirabot.js' || 'https://cssp-resources.integrate.cx/sirabot-uat.js' }}
+  NEXT_PUBLIC_CUSTOMER_PORTAL_APP_ENV: 'development'
+  NEXT_PUBLIC_INSUREMO_TOKEN_URL: 'https://uatb2c.iii.com.sg/api/v1/token'
+  NEXT_PUBLIC_INSUREMO_API_URL: 'https://uatb2c.iii.com.sg/api/v1'
+  NEXT_PUBLIC_INSUREMO_USERNAME: 'b2c.ps.user.uat'
+  NEXT_PUBLIC_INSUREMO_PASSWORD: 'Welcome@1234'
+  NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_REGION: 'ap-southeast-1'
+  NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_ID: 'ap-southeast-1_pWogXYJ8Y'
+  NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_CLIENT_ID: '2asen76e3oiqgnsqhj6vtende2'
+  NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_CLIENT_SECRET: 'ucgp07l121ksavbv3caatb8e5vq5sq1nu5g4hbu7s5qjrtssmid'
+  NEXT_PUBLIC_CUSTOMER_PORTAL_FRONTEND_URL: 'https://uatb2c.iii.com.sg/customer-portal'
+  NEXT_PUBLIC_CUSTOMER_PORTAL_LOGGING: 'true'
+  PRODUCT_NAME : 'customer-portal'
+  S3_FOLDER_KEY: 'customer-portal-insurance'
+jobs:
+  build:
+    if: |
+      github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: All Env Variables
+        run: |
+          env
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Create .env file
+        run: |
+          touch .env
+          echo "NEXT_PUBLIC_GATEWAY_API_URL=${{ env.API_URL }}" >> .env
+          echo "NEXT_PUBLIC_API_VERSION=${{ env.API_VERSION }}" >> .env
+          echo "NEXT_PUBLIC_GITHUB_BUILD_SHA_ID=${{ github.sha }}" >> .env
+          echo "NEXT_PUBLIC_CUSTOMER_PORTAL_FRONTEND_URL=${{ env.NEXT_PUBLIC_CUSTOMER_PORTAL_FRONTEND_URL }}" >> .env
+          echo "NEXT_PUBLIC_INSUREMO_TOKEN_URL=${{ env.NEXT_PUBLIC_INSUREMO_TOKEN_URL }}" >> .env
+          echo "NEXT_PUBLIC_INSUREMO_API_URL=${{ env.NEXT_PUBLIC_INSUREMO_API_URL }}" >> .env
+          echo "NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_REGION=${{ env.NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_REGION }}" >> .env
+          echo "NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_ID=${{ env.NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_ID }}" >> .env
+          echo "NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_CLIENT_ID=${{ env.NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_CLIENT_ID }}" >> .env
+          echo "NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_CLIENT_SECRET=${{ env.NEXT_PUBLIC_CUSTOMER_PORTAL_USER_POLL_CLIENT_SECRET }}" >> .env
+          cat .env
+          cp appspec-${{env.TARGET_ENV}}.yml appspec.yml
+          rm appspec-*.yml
+      - name: Set up Nodejs
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          node-version-file: ''
+          check-latest: false
+          architecture: ''
+          token: ''
+          cache: ''
+          cache-dependency-path: ''
+          registry-url: ''
+          scope: ''
+          always-auth: ''
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install awscli -y
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send build artifacts to S3
+        id: package
+        run: |
+            zip -r deploy.zip . 
+            aws s3 cp deploy.zip s3://${{ env.S3_BUCKET }}/builds/${{ env.S3_FOLDER_KEY }}/deploy-${{ github.sha }}.zip
+            echo "s3_output_zip=s3://${{ env.S3_BUCKET }}/builds/${{ env.S3_FOLDER_KEY }}/deploy-${{ github.sha }}.zip" >> $GITHUB_OUTPUT
+  deploy:
+    needs: build
+    if: |
+      github.ref == 'refs/heads/uat' || github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - name: All Env Variables
+      run: |
+        env
+    - name: Install AWS CLI
+      run: |
+        sudo apt-get update
+        sudo apt-get install awscli -y
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Deploy to ec2 via codedeploy and s3 artifacts
+      id: deploy
+      run: |
+        aws deploy create-deployment \
+          --application-name ${{ env.PRODUCT_NAME }}-insurance-app-${{env.TARGET_ENV}} \
+          --deployment-group-name ${{ env.PRODUCT_NAME }}-insurance-${{env.TARGET_ENV}} \
+          --deployment-config-name CodeDeployDefault.OneAtATime \
+          --s3-location bucket=${{ env.S3_BUCKET }},key=builds/${{ env.S3_FOLDER_KEY }}/deploy-${{ github.sha }}.zip,bundleType=zip \
+          --region ${{ env.AWS_REGION }}
+    - name: Wait for deployment to complete
+      id: wait_deployment
+      run: |
+        # Retrieve the deployment IDs
+        deployment_ids=$(aws deploy list-deployments --application-name ${{ env.PRODUCT_NAME }}-insurance-app-${{env.TARGET_ENV}} --deployment-group-name ${{ env.PRODUCT_NAME }}-insurance-${{env.TARGET_ENV}} --query 'deployments' --output text --region ${{ env.AWS_REGION }})
+
+        # Check if deployment_ids is empty
+        if [[ -z "$deployment_ids" ]]; then
+          echo "Error: No deployment IDs retrieved."
+          exit 1
+        fi
+
+        echo "Retrieved deployment IDs: $deployment_ids"
+
+        # Loop through each deployment ID
+        for deployment_id in $deployment_ids; do
+          echo "Processing deployment ID: $deployment_id"
+
+          while true; do
+            # Fetch the deployment status
+            STATUS=$(aws deploy get-deployment --deployment-id $deployment_id --query "deploymentInfo.status" --output text)
+
+            echo "Current status: $STATUS"
+
+            # Check if the deployment succeeded
+            if [[ "$STATUS" == "Succeeded" ]]; then
+              echo "Deployment Succeeded!"
+              exit 0
+            # Check if the deployment failed or was stopped
+            elif [[ "$STATUS" == "Failed" || "$STATUS" == "Stopped" ]]; then
+              ERROR_MESSAGE=$(aws deploy get-deployment --deployment-id $deployment_id --query "deploymentInfo.errorInformation" --output json)
+              echo "Deployment Failed! Error details: $ERROR_MESSAGE"
+
+              echo "Fetching lifecycle event failure details..."
+              INSTANCE_IDS=$(aws deploy list-deployment-instances --deployment-id $deployment_id --query "instancesList[]" --output text)
+
+              for INSTANCE_ID in $INSTANCE_IDS; do
+                echo "Checking instance: $INSTANCE_ID"
+
+                LIFECYCLE_EVENTS=$(aws deploy get-deployment-instance \
+                  --deployment-id $deployment_id \
+                  --instance-id $INSTANCE_ID \
+                  --query "instanceSummary.lifecycleEvents" \
+                  --output json)
+
+                echo "Lifecycle events for instance $INSTANCE_ID: $LIFECYCLE_EVENTS"
+
+                # Check for failed lifecycle events
+                FAILED_EVENTS=$(aws deploy get-deployment-instance \
+                  --deployment-id $deployment_id \
+                  --instance-id $INSTANCE_ID \
+                  --query "instanceSummary.lifecycleEvents[?status=='Failed']" \
+                  --output json)
+
+                if [[ ! -z "$FAILED_EVENTS" ]]; then
+                  echo "Failed events for instance $INSTANCE_ID: $FAILED_EVENTS"
+                  for EVENT in $(echo "$FAILED_EVENTS" | jq -r '.[] | @base64'); do
+                    _jq() {
+                      echo "${EVENT}" | base64 --decode | jq -r "${1}"
+                    }
+
+                    EVENT_NAME=$(_jq '.lifecycleEventName')
+                    ERROR_MESSAGE=$(_jq '.diagnostics.errorMessage')
+                    SCRIPT_NAME=$(_jq '.diagnostics.scriptName')
+                    LOG_TAIL=$(_jq '.diagnostics.logTail')
+
+                    echo "Event: $EVENT_NAME"
+                    echo "Script: $SCRIPT_NAME"
+                    echo "Error: $ERROR_MESSAGE"
+                    echo "Log tail: $LOG_TAIL"
+                  done
+                else
+                  echo "No failed lifecycle events for instance $INSTANCE_ID"
+                fi
+              done
+              exit 1
+            fi
+
+            echo "Waiting for deployment to complete..."
+            sleep 20
+          done
+        done
